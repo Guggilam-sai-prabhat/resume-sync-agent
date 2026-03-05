@@ -164,7 +164,15 @@ class ResumeAPIClient:
                 f"Allowed: {', '.join(self._MIME_TYPES.keys())}"
             )
 
-        title = filepath.stem  # e.g. "Sai_Prabhat_Full_Stack_Engineering"
+        # Title is the company name, derived from the parent folder.
+        # e.g. ~/resume_sync/Google/resume.pdf → title = "Google"
+        # If the file is directly in resume_sync (no subfolder), fall back to filename stem.
+        parent = filepath.parent.name
+        sync_folder_name = config.SYNC_FOLDER.name
+        if parent == sync_folder_name:
+            title = filepath.stem
+        else:
+            title = parent
         with open(filepath, "rb") as f:
             resp = self._request(
                 "POST",
