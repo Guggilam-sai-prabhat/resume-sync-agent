@@ -1,8 +1,10 @@
 """
 Build filename-keyed indexes for both local and cloud file sets.
 
-These indexes are the basis of the deterministic diff that the sync engine
-performs on every startup cycle.
+The cloud API keys files by title (company name), but each entry also
+contains the actual filename.  We combine them as "title/filename"
+(e.g. "8byte/Sai_Prabhat_Full_Stack.pdf") so they match the local
+folder structure: F:\resume\8byte\Sai_Prabhat_Full_Stack.pdf
 """
 
 from __future__ import annotations
@@ -26,18 +28,20 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class LocalFileInfo:
     """Metadata about a single file on disk."""
-    filename: str
+    filename: str       # relative path key, e.g. "8byte\Sai_Prabhat_Full_Stack.pdf"
     filepath: Path
     checksum: str
     size: int
-    updated_at: datetime  # mtime converted to aware UTC datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True)
 class CloudFileInfo:
-    """Metadata about a single file in the cloud, as returned by GET /resumes."""
+    """Metadata about a single file in the cloud."""
     id: str
-    filename: str
+    filename: str       # matched key, e.g. "8byte/Sai_Prabhat_Full_Stack.pdf"
+    title: str          # company name, e.g. "8byte"
+    real_filename: str  # actual file, e.g. "Sai_Prabhat_Full_Stack.pdf"
     checksum: str
     size: int
     updated_at: datetime
@@ -49,7 +53,7 @@ class CloudFileInfo:
 # ---------------------------------------------------------------------------
 
 def build_local_index(sync_folder: Path) -> Dict[str, LocalFileInfo]:
-    """Scan *sync_folder* and return ``{filename: LocalFileInfo}``."""
+    """Scan *sync_folder* recursively and return ``{relative_path: LocalFileInfo}``."""
     index: Dict[str, LocalFileInfo] = {}
 
     if not sync_folder.is_dir():
@@ -59,12 +63,13 @@ def build_local_index(sync_folder: Path) -> Dict[str, LocalFileInfo]:
 
     for entry in sync_folder.rglob("*"):
         if not entry.is_file():
-            continue  # skip directories / symlinks
+            continue
 
         # Use the path relative to sync_folder as the key so that
-        # "Google/resume.pdf" and "Amazon/resume.pdf" stay distinct.
+        # "8byte\Sai_Prabhat_Full_Stack.pdf" stays distinct.
         relative = entry.relative_to(sync_folder)
-        key = str(relative)
+        # Normalise to forward slashes for cross-platform matching with cloud keys.
+        key = str(relative).replace("\\", "/")
 
         try:
             checksum = compute_sha256(entry)
@@ -88,40 +93,51 @@ def build_local_index(sync_folder: Path) -> Dict[str, LocalFileInfo]:
 
 
 def build_cloud_index(resumes_response: Dict) -> Dict[str, CloudFileInfo]:
-    """Convert the raw ``GET /resumes`` JSON payload into ``{filename: CloudFileInfo}``.
+    """Convert the raw ``GET /resumes`` JSON payload into ``{key: CloudFileInfo}``.
 
-    The API returns::
+    The API returns files keyed by title (company name)::
 
         {
-            "resume_a.pdf": {"id": "...", "checksum": "...", ...},
-            ...
+            "8byte": {
+                "id": "...", "title": "8byte",
+                "filename": "Sai_Prabhat_Full_Stack.pdf",
+                "checksum": "...", ...
+            }
         }
+
+    We build a composite key "title/filename" (e.g. "8byte/Sai_Prabhat_Full_Stack.pdf")
+    to match the local folder structure.
     """
     index: Dict[str, CloudFileInfo] = {}
 
-    for filename, meta in resumes_response.items():
-        # The API may return ISO-8601 strings or already-parsed datetimes.
+    for title, meta in resumes_response.items():
         raw_ts = meta["updated_at"]
         if isinstance(raw_ts, str):
-            # Python < 3.11 doesn't accept the trailing 'Z'; replace with +00:00.
             updated = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
         else:
             updated = raw_ts
 
-        # Ensure timezone-aware for safe comparison with local mtimes.
         if updated.tzinfo is None:
             updated = updated.replace(tzinfo=timezone.utc)
 
+        # The actual filename from the API response.
+        real_filename = meta.get("filename", title)
+
+        # Composite key: "company/resume.pdf" matches local "company\resume.pdf"
+        key = f"{title}/{real_filename}"
+
         info = CloudFileInfo(
             id=meta["id"],
-            filename=filename,
+            filename=key,
+            title=title,
+            real_filename=real_filename,
             checksum=meta["checksum"],
             size=meta["size"],
             updated_at=updated,
             storage_path=meta["storage_path"],
         )
-        index[filename] = info
-        logger.debug("Indexed cloud file: %s (id=%s)", filename, info.id)
+        index[key] = info
+        logger.debug("Indexed cloud file: %s (id=%s)", key, info.id)
 
     logger.info("Cloud index built – %d file(s).", len(index))
     return index
